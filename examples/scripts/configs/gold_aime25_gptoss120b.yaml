@@ -37,10 +37,10 @@ temperature: 1.0
 # Generation parameters (for any on-policy generation)
 max_completion_length: 4096  # Long for math reasoning
 max_length: 8192
-
-# Packing - combine multiple short sequences into one to improve GPU utilization
-packing: true
 max_seq_length: 8192
+
+# Note: packing=true conflicts with GOLDTrainer's custom data collator
+# packing: false (default)
 
 # Training hyperparameters
 learning_rate: 5e-5  # Increased - was too low at end of schedule
@@ -60,12 +60,9 @@ lr_scheduler_type: cosine
 bf16: true
 tf32: true
 
-# Gradient checkpointing (for memory efficiency)
-gradient_checkpointing: true
-gradient_checkpointing_kwargs:
-  use_reentrant: false
-
 # FSDP configuration for multi-GPU
+# Note: Use activation_checkpointing in fsdp_config, NOT gradient_checkpointing
+# (gradient_checkpointing causes redundant AllGather in backward pass with FSDP)
 fsdp: "full_shard auto_wrap"
 fsdp_config:
   backward_prefetch: backward_pre
