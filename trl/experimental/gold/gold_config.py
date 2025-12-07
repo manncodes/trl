@@ -317,6 +317,29 @@ class GOLDConfig(SFTConfig):
             "memory usage low, but waking the engine adds host–device transfer latency."
         },
     )
+
+    # Teacher vLLM parameters (for running teacher on vLLM server)
+    use_vllm_teacher: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use vLLM for the teacher model to get logits. When enabled, the teacher model "
+            "runs on a separate vLLM server and logits are fetched via HTTP. Requires a running vLLM server "
+            "for the teacher model."
+        },
+    )
+    vllm_teacher_server_host: str = field(
+        default="0.0.0.0",
+        metadata={"help": 'Host of the vLLM server for the teacher model when `use_vllm_teacher=True`.'},
+    )
+    vllm_teacher_server_port: int = field(
+        default=8002,
+        metadata={"help": 'Port of the vLLM server for the teacher model when `use_vllm_teacher=True`.'},
+    )
+    vllm_teacher_server_timeout: float = field(
+        default=240.0,
+        metadata={"help": 'Timeout (in seconds) for connecting to the teacher vLLM server.'},
+    )
+
     # Parameters that control the logging
     log_completions: bool = field(
         default=False,

@@ -778,6 +778,14 @@ class GOLDTrainer(SFTTrainer):
 
         if args.teacher_model_init_kwargs is None:
             teacher_model_init_kwargs = {}
+        elif getattr(args, "use_vllm_teacher", False):
+            # When using vLLM teacher, teacher_model_init_kwargs is ignored
+            teacher_model_init_kwargs = {}
+            if args.teacher_model_init_kwargs:
+                warnings.warn(
+                    "teacher_model_init_kwargs is ignored when use_vllm_teacher=True because the teacher "
+                    "model runs on a separate vLLM server."
+                )
         elif not isinstance(teacher_model, str):
             raise ValueError(
                 "You passed teacher_model_init_kwargs to the GOLDConfig, but your teacher_model is already instantiated."
@@ -793,19 +801,37 @@ class GOLDTrainer(SFTTrainer):
         if args.use_uld_loss and args.teacher_tokenizer_name_or_path is None:
             if isinstance(teacher_model, str):
                 args.teacher_tokenizer_name_or_path = teacher_model
-            else:
+            elif not getattr(args, "use_vllm_teacher", False):
                 raise ValueError(
                     "`teacher_tokenizer_name_or_path` must be set when using ULD loss with a pre-instantiated teacher model."
                 )
 
-        if isinstance(teacher_model, str):
+        # Handle vLLM teacher vs local teacher model
+        self.use_vllm_teacher = getattr(args, "use_vllm_teacher", False)
+
+        if self.use_vllm_teacher:
+            # When using vLLM teacher, we don't load the teacher model locally
+            # We'll use the VLLMClient to get logits from the teacher server
+            teacher_model = None
+            if args.teacher_tokenizer_name_or_path is None:
+                raise ValueError(
+                    "`teacher_tokenizer_name_or_path` must be set when using vLLM teacher to tokenize inputs "
+                    "for the teacher model."
+                )
+        elif isinstance(teacher_model, str):
             init_kwargs = dict(teacher_model_init_kwargs)
             if "torch_dtype" in init_kwargs and "dtype" not in init_kwargs:
                 init_kwargs["dtype"] = init_kwargs.pop("torch_dtype")
             teacher_model = create_model_from_path(teacher_model, **init_kwargs)
+
         self.use_uld_loss = args.use_uld_loss
         self.teacher_tokenizer = None
         if args.use_uld_loss and args.teacher_tokenizer_name_or_path is not None:
+            self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_tokenizer_name_or_path)
+            if not hasattr(self.teacher_tokenizer, "pad_token") or self.teacher_tokenizer.pad_token is None:
+                self.teacher_tokenizer.pad_token = self.teacher_tokenizer.eos_token
+        elif self.use_vllm_teacher and args.teacher_tokenizer_name_or_path is not None:
+            # Also load teacher tokenizer when using vLLM teacher (even without ULD loss)
             self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_tokenizer_name_or_path)
             if not hasattr(self.teacher_tokenizer, "pad_token") or self.teacher_tokenizer.pad_token is None:
                 self.teacher_tokenizer.pad_token = self.teacher_tokenizer.eos_token
@@ -828,13 +854,25 @@ class GOLDTrainer(SFTTrainer):
 
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
-        if not args.use_uld_loss:
-            teacher_model.resize_token_embeddings(self.model.config.vocab_size)
 
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+        # Initialize teacher model (local or vLLM)
+        if self.use_vllm_teacher:
+            # Initialize vLLM teacher client
+            self.teacher_model = None
+            self.vllm_teacher_client = VLLMClient(
+                host=args.vllm_teacher_server_host,
+                server_port=args.vllm_teacher_server_port,
+                connection_timeout=args.vllm_teacher_server_timeout,
+            )
         else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            if not args.use_uld_loss:
+                teacher_model.resize_token_embeddings(self.model.config.vocab_size)
+
+            if self.is_deepspeed_enabled:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            self.vllm_teacher_client = None
 
         self.lmbda = args.lmbda
         self.beta = args.beta
@@ -1338,6 +1376,33 @@ class GOLDTrainer(SFTTrainer):
         else:
             return jsd
 
+    def _get_teacher_logits_from_vllm(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Get teacher logits from vLLM server.
+
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+
+        Returns:
+            Teacher logits tensor [batch_size, seq_len, vocab_size]
+        """
+        # Convert to list for JSON serialization
+        input_ids_list = input_ids.cpu().tolist()
+        attention_mask_list = attention_mask.cpu().tolist()
+
+        # Get logits from vLLM server
+        result = self.vllm_teacher_client.get_logits(
+            input_ids=input_ids_list,
+            attention_mask=attention_mask_list,
+        )
+
+        # Convert back to tensor
+        logits = torch.tensor(result["logits"], device=self.accelerator.device, dtype=torch.float32)
+        return logits
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             if "original_prompt_text" in inputs and "original_completion_text" in inputs:
@@ -1378,12 +1443,21 @@ class GOLDTrainer(SFTTrainer):
                 use_cache=False,
             )
 
-            self.teacher_model.eval()
-            with torch.no_grad():
-                outputs_teacher = self.teacher_model(
-                    input_ids=teacher_input_ids,
-                    attention_mask=teacher_attention_mask,
-                )
+            # Get teacher logits (from vLLM server or local model)
+            if self.use_vllm_teacher:
+                teacher_logits = self._get_teacher_logits_from_vllm(teacher_input_ids, teacher_attention_mask)
+                # Create a simple namespace to match the expected interface
+                class TeacherOutputs:
+                    pass
+                outputs_teacher = TeacherOutputs()
+                outputs_teacher.logits = teacher_logits
+            else:
+                self.teacher_model.eval()
+                with torch.no_grad():
+                    outputs_teacher = self.teacher_model(
+                        input_ids=teacher_input_ids,
+                        attention_mask=teacher_attention_mask,
+                    )
 
             # These are not used for ULD loss but are needed if JSD loss were to be used in this branch
             student_prompt_length = inputs["prompts"].shape[1]
@@ -1392,6 +1466,11 @@ class GOLDTrainer(SFTTrainer):
             shifted_labels = inputs["labels"][:, student_prompt_length:]
         else:
             if self.use_liger_gkd_loss:
+                if self.use_vllm_teacher:
+                    raise ValueError(
+                        "Liger GKD loss is not supported with vLLM teacher because it requires hidden states, "
+                        "not just logits. Please disable use_liger_kernel when using use_vllm_teacher=True."
+                    )
                 # Forward only through the base models (avoid lm_head to save memory)
                 unwrapped_student = self.accelerator.unwrap_model(model)
                 if hasattr(unwrapped_student, "get_decoder") and unwrapped_student.get_decoder() is not None:
@@ -1460,12 +1539,23 @@ class GOLDTrainer(SFTTrainer):
                     attention_mask=inputs["attention_mask"],
                 )
 
-                self.teacher_model.eval()
-                with torch.no_grad():
-                    outputs_teacher = self.teacher_model(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
+                # Get teacher logits (from vLLM server or local model)
+                if self.use_vllm_teacher:
+                    teacher_logits = self._get_teacher_logits_from_vllm(
+                        inputs["input_ids"], inputs["attention_mask"]
                     )
+                    # Create a simple namespace to match the expected interface
+                    class TeacherOutputs:
+                        pass
+                    outputs_teacher = TeacherOutputs()
+                    outputs_teacher.logits = teacher_logits
+                else:
+                    self.teacher_model.eval()
+                    with torch.no_grad():
+                        outputs_teacher = self.teacher_model(
+                            input_ids=inputs["input_ids"],
+                            attention_mask=inputs["attention_mask"],
+                        )
 
                 prompt_lengths = inputs["prompts"].shape[1]
                 shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]

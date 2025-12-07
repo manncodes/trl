@@ -1,0 +1,77 @@
+# GOLD Training with vLLM Teacher Configuration
+#
+# This configuration demonstrates how to train a student model using GOLD
+# with a teacher model running on a vLLM server.
+#
+# Usage:
+# 1. Start the teacher vLLM server:
+#    trl vllm-serve --model meta-llama/Llama-3.1-70B-Instruct --port 8002 --tensor-parallel-size 4
+#
+# 2. Run training:
+#    python examples/scripts/gold_vllm_teacher_example.py --config examples/scripts/configs/gold_vllm_teacher.yaml
+
+# Output directory
+output_dir: ./gold-vllm-teacher-output
+
+# Teacher vLLM configuration (teacher runs on separate vLLM server)
+use_vllm_teacher: true
+vllm_teacher_server_host: "0.0.0.0"
+vllm_teacher_server_port: 8002
+vllm_teacher_server_timeout: 240.0
+teacher_tokenizer_name_or_path: meta-llama/Llama-3.1-70B-Instruct
+
+# Student vLLM configuration (optional, for on-policy generation)
+# If you want the student to also use vLLM for generation:
+# use_vllm: true
+# vllm_mode: server
+# vllm_server_host: "0.0.0.0"
+# vllm_server_port: 8001
+
+# Loss configuration
+# Use ULD (Universal Logit Distillation) loss for cross-tokenizer distillation
+use_uld_loss: true
+use_extended_uld: true  # Enable extended alignment for different tokenizers
+
+# JSD interpolation coefficient (0.0=KL, 1.0=reverse KL, 0.5=JSD)
+beta: 0.5
+
+# On-policy vs off-policy ratio (0.0=all off-policy, 1.0=all on-policy)
+lmbda: 0.5
+
+# Temperature for sampling
+temperature: 0.9
+
+# Generation parameters
+max_completion_length: 512
+max_length: 2048
+
+# Training parameters
+learning_rate: 1e-6
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+num_train_epochs: 1
+warmup_ratio: 0.1
+
+# Optimizer
+optim: adamw_torch_fused
+
+# Mixed precision
+bf16: true
+
+# Logging
+logging_steps: 10
+log_completions: true
+log_completions_steps: 100
+
+# Save strategy
+save_strategy: steps
+save_steps: 500
+
+# Evaluation
+eval_strategy: "no"
+
+# Seed for reproducibility
+seed: 42
+
+# Disable dropout for distillation
+disable_dropout: true

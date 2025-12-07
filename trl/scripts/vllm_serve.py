@@ -357,6 +357,55 @@ def llm_worker(
     # Send ready signal to parent process
     connection.send({"status": "ready"})
 
+    def get_logits(input_ids: list[list[int]], attention_mask: list[list[int]]) -> list[list[list[float]]]:
+        """
+        Perform forward pass and return full vocabulary logits.
+
+        This uses vLLM's encode method to get hidden states and then applies the LM head.
+        """
+        import torch
+
+        # Convert to tensors
+        max_len = max(len(ids) for ids in input_ids)
+        padded_input_ids = []
+        padded_attention_mask = []
+
+        for ids, mask in zip(input_ids, attention_mask, strict=True):
+            pad_len = max_len - len(ids)
+            padded_input_ids.append(ids + [0] * pad_len)
+            padded_attention_mask.append(mask + [0] * pad_len)
+
+        # Get the model's device
+        device = next(llm.llm_engine.model_executor.driver_worker.model_runner.model.parameters()).device
+
+        input_ids_tensor = torch.tensor(padded_input_ids, dtype=torch.long, device=device)
+        attention_mask_tensor = torch.tensor(padded_attention_mask, dtype=torch.long, device=device)
+
+        # Access the underlying model for forward pass
+        model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+
+        with torch.no_grad():
+            # Perform forward pass
+            outputs = model(
+                input_ids=input_ids_tensor,
+                positions=torch.arange(max_len, device=device).unsqueeze(0).expand(len(input_ids), -1),
+                kv_caches=None,  # No KV cache for single forward pass
+            )
+
+            # outputs is typically hidden_states, we need to apply lm_head
+            if hasattr(outputs, "logits"):
+                logits = outputs.logits
+            elif hasattr(model, "lm_head"):
+                logits = model.lm_head(outputs)
+            else:
+                # For some model architectures, the output is the logits directly
+                logits = outputs
+
+            # Convert to list for JSON serialization
+            logits_list = logits.cpu().float().tolist()
+
+        return logits_list
+
     while True:
         # Wait for commands from the parent process
         try:
@@ -369,8 +418,14 @@ def llm_worker(
         if command["type"] in ["call", "fire_and_forget"]:
             method_name = command["method"]
             args, kwargs = command.get("args", ()), command.get("kwargs", {})
-            method = getattr(llm, method_name)
-            result = method(*args, **kwargs)
+
+            # Handle special get_logits method
+            if method_name == "get_logits":
+                result = get_logits(**kwargs)
+            else:
+                method = getattr(llm, method_name)
+                result = method(*args, **kwargs)
+
             if command["type"] == "call":
                 connection.send(result)
         elif command["type"] == "shutdown":
@@ -834,6 +889,63 @@ def main(script_args: ScriptArguments):
         for connection in connections:
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
         return {"message": "Request received, closing communicator"}
+
+    class GetLogitsRequest(BaseModel):
+        input_ids: list[list[int]]
+        attention_mask: list[list[int]] | None = None
+
+    class GetLogitsResponse(BaseModel):
+        logits: list[list[list[float]]]  # [batch_size, seq_len, vocab_size]
+
+    @app.post("/get_logits/", response_model=GetLogitsResponse)
+    async def get_logits(request: GetLogitsRequest):
+        """
+        Performs a forward pass on the provided input_ids and returns full vocabulary logits.
+
+        This endpoint is useful for knowledge distillation where full vocabulary distributions
+        are needed from a teacher model.
+
+        Args:
+            request (`GetLogitsRequest`):
+                - `input_ids` (list of list of `int`): Batch of tokenized input sequences.
+                - `attention_mask` (list of list of `int`, *optional*): Attention mask for the input.
+                  If not provided, a mask of all 1s will be used.
+
+        Returns:
+            `GetLogitsResponse`:
+                - `logits` (list of list of list of `float`): Full vocabulary logits for each
+                  position in each sequence. Shape: [batch_size, seq_len, vocab_size].
+
+        Example request:
+        ```json
+        {"input_ids": [[101, 102, 103], [201, 202, 203]]}
+        ```
+        """
+        # For now, we only support single DP worker for logits computation
+        # This is because gathering full vocab logits across workers would be expensive
+        if script_args.data_parallel_size > 1:
+            logger.warning(
+                "get_logits endpoint is only supported with data_parallel_size=1. "
+                "Using first worker only."
+            )
+
+        # Prepare attention mask if not provided
+        if request.attention_mask is None:
+            attention_mask = [[1] * len(ids) for ids in request.input_ids]
+        else:
+            attention_mask = request.attention_mask
+
+        # Send to the first worker for forward pass
+        kwargs = {
+            "input_ids": request.input_ids,
+            "attention_mask": attention_mask,
+        }
+        connections[0].send({"type": "call", "method": "get_logits", "kwargs": kwargs})
+
+        # Receive results
+        logits = connections[0].recv()
+
+        return {"logits": logits}
 
     # Start the server
     uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)

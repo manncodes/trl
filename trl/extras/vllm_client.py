@@ -480,6 +480,50 @@ class VLLMClient:
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
+    def get_logits(
+        self,
+        input_ids: list[list[int]],
+        attention_mask: list[list[int]] | None = None,
+    ) -> dict[str, list]:
+        """
+        Performs a forward pass on the provided input_ids and returns full vocabulary logits.
+
+        This is useful for knowledge distillation where full vocabulary distributions are needed
+        from a teacher model running on a vLLM server.
+
+        Args:
+            input_ids (`list[list[int]]`):
+                Batch of tokenized input sequences.
+            attention_mask (`list[list[int]]`, *optional*):
+                Attention mask for the input. If not provided, a mask of all 1s will be used.
+
+        Returns:
+            `dict` with keys:
+                - `logits` (`list[list[list[float]]]`):
+                    Full vocabulary logits for each position in each sequence.
+                    Shape: [batch_size, seq_len, vocab_size].
+
+        Example:
+            ```python
+            >>> client = VLLMClient()
+            >>> result = client.get_logits([[101, 102, 103], [201, 202, 203]])
+            >>> logits = result["logits"]  # Shape: [2, 3, vocab_size]
+            ```
+        """
+        url = f"{self.base_url}/get_logits/"
+        response = self.session.post(
+            url,
+            json={
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            },
+        )
+        if response.status_code == 200:
+            json_response = response.json()
+            return {"logits": json_response["logits"]}
+        else:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
     def close_communicator(self):
         """
         Closes the weight update group and cleans up the communication group.
