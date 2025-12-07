@@ -43,12 +43,14 @@ packing: true
 max_seq_length: 8192
 
 # Training hyperparameters
-learning_rate: 1e-5
+learning_rate: 5e-5  # Increased - was too low at end of schedule
 per_device_train_batch_size: 8  # Increased from 2 - more compute per batch
 gradient_accumulation_steps: 1  # Reduced - less sync overhead with small dataset
-num_train_epochs: 10  # More epochs since dataset is small (30 samples)
-warmup_ratio: 0.1
+num_train_epochs: 50  # Many more epochs for small dataset (30 samples)
+max_steps: -1  # Use epochs, not steps
+warmup_ratio: 0.05  # Shorter warmup for small dataset
 weight_decay: 0.01
+max_grad_norm: 1.0  # Clip gradients - your grad_norm was 149!
 
 # Optimizer
 optim: adamw_torch_fused
@@ -72,7 +74,7 @@ fsdp_config:
   activation_checkpointing: true
 
 # Logging
-logging_steps: 10
+logging_steps: 1  # Log every step for visibility
 log_completions: true
 log_completions_steps: 50
 report_to: wandb
