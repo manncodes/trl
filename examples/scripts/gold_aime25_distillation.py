@@ -26,26 +26,54 @@ Your vLLM server is running at:
 - Base URL: http://qpn744-vllm-gptoss120b-svc.llm-pretraining.svc.cluster.local:8000/v1
 - Model: openai/gpt-oss-120b
 
-## Data Requirements
+## Data Formats
 
-For AIME25 distillation, you need a dataset with math problems. Options:
-1. Pre-generated teacher completions (offline distillation)
-2. On-the-fly teacher generation (online distillation with seq_kd)
+The script supports multiple data formats:
+
+1. **JSONL format** (recommended): One JSON object per line
+   ```
+   {"problem": "Find the sum of all integer bases...", "answer": 70, "id": "0"}
+   {"problem": "Let S be the set of all positive...", "answer": 42, "id": "1"}
+   ```
+
+2. **JSON format**: Array of objects
+   ```json
+   [{"problem": "...", "answer": 70}, {"problem": "...", "answer": 42}]
+   ```
+
+3. **Pre-generated solutions**: Include "solution" field to skip teacher generation
+   ```
+   {"problem": "...", "solution": "Step 1: ...", "answer": 70}
+   ```
+
+## Prompt Template
+
+Problems are formatted with the following template:
+```
+{question}
+Please reason step by step, and put your final answer within \\boxed{}.
+```
 
 ## Usage
 
 ```bash
-# Option 1: Using pre-generated teacher completions
-python examples/scripts/gold_aime25_distillation.py \
-    --model_name_or_path path/to/custom_split_llama \
-    --dataset_path path/to/aime25_with_solutions.json \
+# Option 1: Using JSONL file with problems only (generates teacher completions)
+python examples/scripts/gold_aime25_distillation.py \\
+    --model_name_or_path path/to/custom_split_llama \\
+    --dataset_path path/to/aime25.jsonl \\
     --output_dir ./aime25-distilled-model
 
-# Option 2: Generate teacher completions first, then train
-python examples/scripts/gold_aime25_distillation.py \
-    --model_name_or_path path/to/custom_split_llama \
-    --generate_teacher_data \
-    --aime_problems_path path/to/aime25_problems.json \
+# Option 2: Using pre-generated teacher completions
+python examples/scripts/gold_aime25_distillation.py \\
+    --model_name_or_path path/to/custom_split_llama \\
+    --dataset_path path/to/aime25_with_solutions.json \\
+    --output_dir ./aime25-distilled-model
+
+# Option 3: Generate teacher completions from problems file
+python examples/scripts/gold_aime25_distillation.py \\
+    --model_name_or_path path/to/custom_split_llama \\
+    --generate_teacher_data \\
+    --aime_problems_path path/to/aime25.jsonl \\
     --output_dir ./aime25-distilled-model
 ```
 """
@@ -117,20 +145,59 @@ class ScriptArguments:
     )
 
 
-def load_aime_problems(path: str) -> list[str]:
-    """Load AIME problems from a JSON file."""
-    with open(path) as f:
-        data = json.load(f)
+AIME_PROMPT_TEMPLATE = """{question}
+Please reason step by step, and put your final answer within \\boxed{{}}."""
 
+
+def load_aime_problems(path: str, apply_template: bool = True) -> list[str]:
+    """Load AIME problems from a JSON or JSONL file.
+
+    Args:
+        path: Path to the JSON or JSONL file containing problems.
+        apply_template: Whether to apply the AIME prompt template.
+
+    Returns:
+        List of problem strings (with template applied if requested).
+    """
+    path_obj = Path(path)
+
+    # Determine format and load data
+    if path_obj.suffix == ".jsonl":
+        # JSONL format: one JSON object per line
+        data = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+    else:
+        # Regular JSON format
+        with open(path) as f:
+            data = json.load(f)
+
+    # Extract problems from data
+    problems = []
     if isinstance(data, list):
+        if len(data) == 0:
+            raise ValueError(f"Empty dataset: {path}")
         if isinstance(data[0], str):
-            return data
+            problems = data
         elif isinstance(data[0], dict):
             # Try common keys
             for key in ["problem", "question", "prompt", "content"]:
                 if key in data[0]:
-                    return [item[key] for item in data]
-    raise ValueError(f"Could not parse AIME problems from {path}")
+                    problems = [item[key] for item in data]
+                    break
+            if not problems:
+                raise ValueError(f"Could not find problem field in data. Available keys: {list(data[0].keys())}")
+    else:
+        raise ValueError(f"Expected list of problems, got {type(data)}")
+
+    # Apply prompt template if requested
+    if apply_template:
+        problems = [AIME_PROMPT_TEMPLATE.format(question=p) for p in problems]
+
+    return problems
 
 
 def generate_teacher_completions(
@@ -182,14 +249,57 @@ def load_or_create_dataset(args: ScriptArguments) -> Dataset:
     if args.dataset_path:
         # Load from local file
         path = Path(args.dataset_path)
-        if path.suffix == ".json":
+
+        # Load data based on format
+        if path.suffix == ".jsonl":
+            # JSONL format: one JSON object per line
+            data = []
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        data.append(json.loads(line))
+        elif path.suffix == ".json":
             with open(path) as f:
                 data = json.load(f)
-            dataset = Dataset.from_list(data)
-        elif path.suffix == ".jsonl":
-            dataset = Dataset.from_json(str(path))
         else:
             raise ValueError(f"Unsupported file format: {path.suffix}")
+
+        # Check if this is already in messages format (pre-generated solutions)
+        if isinstance(data[0], dict) and "messages" in data[0]:
+            dataset = Dataset.from_list(data)
+        elif isinstance(data[0], dict) and "problem" in data[0]:
+            # AIME-style format: {"problem": "...", "answer": ..., "id": "..."}
+            # This needs teacher completions - either pre-computed or generate them
+            if "solution" in data[0]:
+                # Has pre-computed solutions, convert to messages format
+                def convert_to_messages(item):
+                    prompt = AIME_PROMPT_TEMPLATE.format(question=item["problem"])
+                    return {
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": item["solution"]},
+                        ]
+                    }
+                dataset = Dataset.from_list([convert_to_messages(item) for item in data])
+            else:
+                # No solutions - generate from teacher
+                logger.info("Dataset has problems but no solutions. Generating from teacher...")
+                problems = [AIME_PROMPT_TEMPLATE.format(question=item["problem"]) for item in data]
+                training_data = generate_teacher_completions(
+                    problems=problems,
+                    base_url=args.teacher_base_url,
+                    model=args.teacher_model,
+                )
+                dataset = Dataset.from_list(training_data)
+
+                # Save for later reuse
+                output_path = str(path.stem) + "_with_solutions.json"
+                with open(output_path, "w") as f:
+                    json.dump(training_data, f, indent=2)
+                logger.info(f"Saved teacher completions to {output_path}")
+        else:
+            raise ValueError(f"Unrecognized data format. Expected 'messages' or 'problem' field.")
 
     elif args.dataset_name:
         # Load from HuggingFace
@@ -200,17 +310,18 @@ def load_or_create_dataset(args: ScriptArguments) -> Dataset:
             if "problem" in dataset.column_names and "solution" in dataset.column_names:
                 # NuminaMath-style format
                 def convert_to_messages(example):
+                    prompt = AIME_PROMPT_TEMPLATE.format(question=example["problem"])
                     return {
                         "messages": [
-                            {"role": "user", "content": example["problem"]},
+                            {"role": "user", "content": prompt},
                             {"role": "assistant", "content": example["solution"]},
                         ]
                     }
                 dataset = dataset.map(convert_to_messages)
 
     elif args.generate_teacher_data and args.aime_problems_path:
-        # Generate teacher completions
-        problems = load_aime_problems(args.aime_problems_path)
+        # Generate teacher completions from problems file
+        problems = load_aime_problems(args.aime_problems_path, apply_template=True)
         training_data = generate_teacher_completions(
             problems=problems,
             base_url=args.teacher_base_url,
@@ -227,16 +338,18 @@ def load_or_create_dataset(args: ScriptArguments) -> Dataset:
     else:
         # Create a sample dataset for demonstration
         logger.warning("No dataset provided. Creating sample AIME-style problems for demonstration.")
+        sample_question_1 = "Find the number of positive integers n ≤ 1000 such that 15n is a perfect square."
+        sample_question_2 = "Let S be the set of all positive rational numbers r such that the decimal representation of r has a period of exactly 6. Find the sum of all elements in S that are less than 1."
         sample_data = [
             {
                 "messages": [
-                    {"role": "user", "content": "Find the number of positive integers n ≤ 1000 such that 15n is a perfect square."},
+                    {"role": "user", "content": AIME_PROMPT_TEMPLATE.format(question=sample_question_1)},
                     {"role": "assistant", "content": "For 15n to be a perfect square, we need n = 15k² for some positive integer k.\n\nSince n ≤ 1000, we have 15k² ≤ 1000, so k² ≤ 66.67, meaning k ≤ 8.\n\nThe valid values of k are 1, 2, 3, 4, 5, 6, 7, 8.\n\nTherefore, there are \\boxed{8} such positive integers."},
                 ]
             },
             {
                 "messages": [
-                    {"role": "user", "content": "Let S be the set of all positive rational numbers r such that the decimal representation of r has a period of exactly 6. Find the sum of all elements in S that are less than 1."},
+                    {"role": "user", "content": AIME_PROMPT_TEMPLATE.format(question=sample_question_2)},
                     {"role": "assistant", "content": "A rational number has a decimal period of exactly 6 if and only if it can be written as a/999999 where gcd(a, 999999) = 1 and the period is exactly 6 (not a divisor of 6).\n\n999999 = 3³ × 7 × 11 × 13 × 37\n\nFor the period to be exactly 6, we need to exclude fractions whose denominators divide 9, 99, or 999 (periods 1, 2, 3).\n\nUsing inclusion-exclusion and Euler's totient function, we can compute the sum.\n\nThe answer is \\boxed{499999}."},
                 ]
             },
