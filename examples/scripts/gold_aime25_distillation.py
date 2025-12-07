@@ -205,10 +205,11 @@ def generate_teacher_completions(
     problems: list[str],
     base_url: str,
     model: str,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
     temperature: float = 0.7,
 ) -> list[dict]:
-    """Generate teacher completions using the vLLM server."""
+    """Generate teacher completions using the vLLM server with <think> and <answer> format."""
+    import re
     from trl.extras.vllm_openai_client import VLLMOpenAIClient
 
     logger.info(f"Connecting to teacher vLLM server at {base_url}")
@@ -218,8 +219,12 @@ def generate_teacher_completions(
     )
 
     system_prompt = (
-        "You are a mathematical reasoning expert. Solve the given problem step by step. "
-        "Show your complete reasoning process, then provide the final answer in \\boxed{}."
+        "You are a mathematical reasoning expert. For each problem:\n"
+        "1. First, show your complete step-by-step reasoning inside <think>...</think> tags\n"
+        "2. Then, provide your final answer inside <answer>...</answer> tags\n\n"
+        "Format your response EXACTLY as:\n"
+        "<think>\n[Your detailed step-by-step reasoning here]\n</think>\n"
+        "<answer>\n[Your final answer, including \\boxed{} for the numerical result]\n</answer>"
     )
 
     logger.info(f"Generating completions for {len(problems)} problems...")
@@ -233,12 +238,46 @@ def generate_teacher_completions(
     # Format as training data, filtering out failed requests
     training_data = []
     failed_count = 0
+    malformed_count = 0
+
     for prompt, completion in zip(result["prompts"], result["completions"]):
         # Skip failed/null completions
         if completion is None or completion.startswith("ERROR:") or completion.strip() == "":
             failed_count += 1
             logger.warning(f"Skipping failed completion for prompt: {prompt[:100]}...")
             continue
+
+        # Check if completion has the expected format
+        has_think = "<think>" in completion and "</think>" in completion
+        has_answer = "<answer>" in completion and "</answer>" in completion
+
+        if not has_think or not has_answer:
+            # Try to wrap the completion if it's missing tags
+            # Look for \boxed{} to identify the answer
+            boxed_match = re.search(r'(\\boxed\{[^}]+\})', completion)
+            if boxed_match:
+                # Split at the boxed answer
+                boxed_pos = completion.rfind("\\boxed{")
+                # Find a good split point (look for "Therefore", "Thus", "So", "Hence", "The answer is")
+                split_patterns = [
+                    r'\n(?:Therefore|Thus|So|Hence|The answer is|Finally)',
+                    r'\n\n(?=[^\n]*\\boxed)',
+                ]
+                split_pos = boxed_pos
+                for pattern in split_patterns:
+                    match = re.search(pattern, completion[:boxed_pos + 50], re.IGNORECASE)
+                    if match:
+                        split_pos = match.start()
+                        break
+
+                thinking = completion[:split_pos].strip()
+                answer = completion[split_pos:].strip()
+                completion = f"<think>\n{thinking}\n</think>\n<answer>\n{answer}\n</answer>"
+                malformed_count += 1
+            else:
+                # No boxed answer found, wrap entire thing as thinking
+                completion = f"<think>\n{completion}\n</think>\n<answer>\nUnable to extract final answer.\n</answer>"
+                malformed_count += 1
 
         training_data.append({
             "messages": [
@@ -250,8 +289,10 @@ def generate_teacher_completions(
 
     if failed_count > 0:
         logger.warning(f"Filtered out {failed_count}/{len(problems)} failed completions")
+    if malformed_count > 0:
+        logger.info(f"Reformatted {malformed_count} completions to <think>/<answer> format")
 
-    logger.info(f"Successfully generated {len(training_data)} training examples")
+    logger.info(f"Successfully generated {len(training_data)} training examples with <think>/<answer> format")
     return training_data
 
 
