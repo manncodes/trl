@@ -1430,6 +1430,11 @@ class GOLDTrainer(SFTTrainer):
         return logits
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # For sequence-level KD (seq_kd=True), we use standard SFT loss on teacher completions
+        # instead of logit distillation. This is useful when teacher API doesn't provide logits.
+        if self.seq_kd:
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             if "original_prompt_text" in inputs and "original_completion_text" in inputs:
                 prompt_texts = inputs["original_prompt_text"]
