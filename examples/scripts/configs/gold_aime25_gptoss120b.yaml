@@ -77,7 +77,7 @@ fsdp_config:
 logging_steps: 1  # Log every step for visibility
 log_completions: true
 log_completions_steps: 50
-report_to: wandb
+report_to: none  # Disabled wandb due to bug - use "wandb" to re-enable
 run_name: aime25-gold-distillation
 
 # Save strategy
