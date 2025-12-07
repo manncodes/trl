@@ -80,6 +80,7 @@ python examples/scripts/gold_aime25_distillation.py \\
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -404,11 +405,32 @@ def main():
     # from your_custom_module import CustomSplitLlamaForCausalLM
     # model = CustomSplitLlamaForCausalLM.from_pretrained(...)
     logger.info(f"Loading student model from {script_args.model_name_or_path}")
+
+    # Check if running distributed
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_distributed = local_rank != -1
+
+    # Model loading kwargs for efficient distributed loading
+    model_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "trust_remote_code": script_args.trust_remote_code,
+        "attn_implementation": "flash_attention_2",  # Use Flash Attention 2 on H100s
+    }
+
+    # For FSDP, we load on CPU first then shard - more memory efficient
+    if is_distributed:
+        model_kwargs["low_cpu_mem_usage"] = True
+
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=script_args.trust_remote_code,
+        **model_kwargs,
     )
+
+    # Enable gradient checkpointing for memory efficiency
+    if training_args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     # Override vLLM teacher settings from script args
     training_args.use_vllm_teacher = True
