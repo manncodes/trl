@@ -38,11 +38,15 @@ temperature: 1.0
 max_completion_length: 4096  # Long for math reasoning
 max_length: 8192
 
+# Packing - combine multiple short sequences into one to improve GPU utilization
+packing: true
+max_seq_length: 8192
+
 # Training hyperparameters
 learning_rate: 1e-5
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 4
-num_train_epochs: 3
+per_device_train_batch_size: 8  # Increased from 2 - more compute per batch
+gradient_accumulation_steps: 1  # Reduced - less sync overhead with small dataset
+num_train_epochs: 10  # More epochs since dataset is small (30 samples)
 warmup_ratio: 0.1
 weight_decay: 0.01
 
@@ -89,6 +93,7 @@ seed: 42
 disable_dropout: true
 
 # DataLoader settings for multi-GPU
-dataloader_num_workers: 4
+dataloader_num_workers: 8  # More workers for faster loading
 dataloader_pin_memory: true
-dataloader_prefetch_factor: 2
+dataloader_prefetch_factor: 4  # Prefetch more batches
+dataloader_drop_last: true  # Avoid uneven batches that cause sync issues
