@@ -1433,13 +1433,19 @@ class GOLDTrainer(SFTTrainer):
         # For sequence-level KD (seq_kd=True), we use standard SFT loss on teacher completions
         # instead of logit distillation. This is useful when teacher API doesn't provide logits.
         if self.seq_kd:
-            # Filter out GOLD/SFT-specific keys that the model's forward() doesn't accept
-            # Keep only standard model inputs: input_ids, attention_mask, labels, position_ids, etc.
-            non_model_keys = [
-                "prompts", "prompt_attention_mask",
-                "original_prompt_text", "original_completion_text",
-            ]
-            filtered_inputs = {k: v for k, v in inputs.items() if k not in non_model_keys}
+            # Filter inputs to only include keys the model's forward() accepts.
+            # Use whitelist approach for robustness - DataCollator and trainers may add various keys.
+            model_input_keys = {
+                # Standard model inputs
+                "input_ids", "attention_mask", "labels", "position_ids",
+                "past_key_values", "inputs_embeds", "use_cache",
+                "output_attentions", "output_hidden_states", "return_dict",
+                "cache_position", "num_logits_to_keep",
+                # Padding-free / context-parallel keys
+                "cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k",
+                "shift_labels",
+            }
+            filtered_inputs = {k: v for k, v in inputs.items() if k in model_input_keys}
             return super().compute_loss(model, filtered_inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
 
         if self.use_uld_loss and self.teacher_tokenizer is not None:
