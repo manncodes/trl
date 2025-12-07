@@ -152,28 +152,50 @@ class VLLMOpenAIClient:
         top_logprobs: int | None,
         semaphore: asyncio.Semaphore,
         idx: int,
+        max_retries: int = 3,
         **kwargs,
     ) -> tuple[int, str, Any]:
-        """Single async chat completion with semaphore for concurrency control."""
+        """Single async chat completion with semaphore for concurrency control and retries."""
         async with semaphore:
-            try:
-                response = await self.async_client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    logprobs=logprobs,
-                    top_logprobs=top_logprobs,
-                    **kwargs,
-                )
-                content = response.choices[0].message.content
-                lp = response.choices[0].logprobs if logprobs else None
-                return (idx, content, lp)
-            except Exception as e:
-                logger.error(f"Request {idx} failed: {e}")
-                return (idx, f"ERROR: {e}", None)
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    response = await self.async_client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        logprobs=logprobs,
+                        top_logprobs=top_logprobs,
+                        **kwargs,
+                    )
+                    content = response.choices[0].message.content
+
+                    # Handle null/empty content - retry
+                    if content is None or content.strip() == "":
+                        last_error = "Empty response from model"
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Request {idx} got empty response, retrying ({attempt + 1}/{max_retries})...")
+                            await asyncio.sleep(1.0 * (attempt + 1))  # backoff
+                            continue
+                        else:
+                            logger.error(f"Request {idx} failed after {max_retries} attempts: {last_error}")
+                            return (idx, f"ERROR: {last_error}", None)
+
+                    lp = response.choices[0].logprobs if logprobs else None
+                    return (idx, content, lp)
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Request {idx} failed: {e}, retrying ({attempt + 1}/{max_retries})...")
+                        await asyncio.sleep(1.0 * (attempt + 1))  # backoff
+                    else:
+                        logger.error(f"Request {idx} failed after {max_retries} attempts: {e}")
+                        return (idx, f"ERROR: {e}", None)
+
+            return (idx, f"ERROR: {last_error}", None)
 
     async def _async_completion_single(
         self,

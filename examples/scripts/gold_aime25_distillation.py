@@ -229,9 +229,16 @@ def generate_teacher_completions(
         system_prompt=system_prompt,
     )
 
-    # Format as training data
+    # Format as training data, filtering out failed requests
     training_data = []
+    failed_count = 0
     for prompt, completion in zip(result["prompts"], result["completions"]):
+        # Skip failed/null completions
+        if completion is None or completion.startswith("ERROR:") or completion.strip() == "":
+            failed_count += 1
+            logger.warning(f"Skipping failed completion for prompt: {prompt[:100]}...")
+            continue
+
         training_data.append({
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -240,6 +247,10 @@ def generate_teacher_completions(
             ]
         })
 
+    if failed_count > 0:
+        logger.warning(f"Filtered out {failed_count}/{len(problems)} failed completions")
+
+    logger.info(f"Successfully generated {len(training_data)} training examples")
     return training_data
 
 
