@@ -475,8 +475,34 @@ def load_or_create_dataset(args: ScriptArguments) -> Dataset:
 
 
 def main():
+    import sys
+
     parser = HfArgumentParser((ScriptArguments, GOLDConfig))
-    script_args, training_args = parser.parse_args_into_dataclasses()
+
+    # Support loading from YAML config file
+    if len(sys.argv) >= 2 and sys.argv[1].endswith(('.yaml', '.yml', '.json')):
+        # First arg is config file path
+        config_path = sys.argv[1]
+        # Parse remaining args as overrides
+        script_args, training_args = parser.parse_yaml_file(config_path, allow_extra_keys=True)
+        # Apply any command-line overrides
+        if len(sys.argv) > 2:
+            override_args = sys.argv[2:]
+            script_args, training_args = parser.parse_args_into_dataclasses(
+                args=override_args,
+                namespace=(script_args, training_args)
+            )
+    elif "--config" in sys.argv:
+        # Handle --config flag
+        config_idx = sys.argv.index("--config")
+        config_path = sys.argv[config_idx + 1]
+        remaining_args = sys.argv[1:config_idx] + sys.argv[config_idx + 2:]
+        script_args, training_args = parser.parse_yaml_file(config_path, allow_extra_keys=True)
+        # Apply command-line overrides
+        if remaining_args:
+            script_args, training_args = parser.parse_args_into_dataclasses(args=remaining_args)
+    else:
+        script_args, training_args = parser.parse_args_into_dataclasses()
 
     # Load dataset
     dataset = load_or_create_dataset(script_args)
