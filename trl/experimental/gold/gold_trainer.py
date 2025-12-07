@@ -825,6 +825,7 @@ class GOLDTrainer(SFTTrainer):
             teacher_model = create_model_from_path(teacher_model, **init_kwargs)
 
         self.use_uld_loss = args.use_uld_loss
+        self.seq_kd = args.seq_kd  # Set early for use in vLLM teacher initialization
         self.teacher_tokenizer = None
         if args.use_uld_loss and args.teacher_tokenizer_name_or_path is not None:
             self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_tokenizer_name_or_path)
@@ -904,7 +905,6 @@ class GOLDTrainer(SFTTrainer):
         self.beta = args.beta
         self.temperature = args.temperature
         self.top_p = args.top_p
-        self.seq_kd = args.seq_kd
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
         self._on_policy_loss_total = 0.0

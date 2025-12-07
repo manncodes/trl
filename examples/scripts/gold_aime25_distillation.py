@@ -150,15 +150,17 @@ AIME_PROMPT_TEMPLATE = """{question}
 Please reason step by step, and put your final answer within \\boxed{{}}."""
 
 
-def load_aime_problems(path: str, apply_template: bool = True) -> list[str]:
+def load_aime_problems(path: str, apply_template: bool = True, return_raw: bool = False) -> list[str] | list[dict]:
     """Load AIME problems from a JSON or JSONL file.
 
     Args:
         path: Path to the JSON or JSONL file containing problems.
         apply_template: Whether to apply the AIME prompt template.
+        return_raw: If True, return raw data dicts with problem/answer fields.
 
     Returns:
-        List of problem strings (with template applied if requested).
+        List of problem strings (with template applied if requested), or
+        list of raw data dicts if return_raw=True.
     """
     path_obj = Path(path)
 
@@ -176,11 +178,20 @@ def load_aime_problems(path: str, apply_template: bool = True) -> list[str]:
         with open(path) as f:
             data = json.load(f)
 
+    if isinstance(data, list) and len(data) == 0:
+        raise ValueError(f"Empty dataset: {path}")
+
+    # Return raw data if requested (for verification with answers)
+    if return_raw:
+        if isinstance(data[0], dict):
+            return data
+        else:
+            # Convert string list to dict format
+            return [{"problem": p, "answer": ""} for p in data]
+
     # Extract problems from data
     problems = []
     if isinstance(data, list):
-        if len(data) == 0:
-            raise ValueError(f"Empty dataset: {path}")
         if isinstance(data[0], str):
             problems = data
         elif isinstance(data[0], dict):
@@ -201,14 +212,55 @@ def load_aime_problems(path: str, apply_template: bool = True) -> list[str]:
     return problems
 
 
+def verify_answer(completion: str, gold_answer: str | int | float) -> bool:
+    """Verify if the completion contains the correct answer using math_verify."""
+    try:
+        from math_verify import parse, verify
+    except ImportError:
+        logger.warning("math_verify not installed. Install with: pip install math-verify[antlr4_13_2]")
+        return False
+
+    try:
+        # Parse gold answer
+        gold_parsed = parse(str(gold_answer))
+
+        # Extract answer from completion (look in <answer> tags or \boxed{})
+        import re
+        answer_text = completion
+
+        # Try to extract from <answer> tags first
+        answer_match = re.search(r'<answer>(.*?)</answer>', completion, re.DOTALL)
+        if answer_match:
+            answer_text = answer_match.group(1)
+
+        # Try to find \boxed{} content
+        boxed_match = re.search(r'\\boxed\{([^}]+)\}', answer_text)
+        if boxed_match:
+            answer_text = boxed_match.group(1)
+
+        # Parse the extracted answer
+        pred_parsed = parse(answer_text)
+
+        return verify(gold_parsed, pred_parsed)
+    except Exception as e:
+        logger.debug(f"Verification failed: {e}")
+        return False
+
+
 def generate_teacher_completions(
-    problems: list[str],
+    problems: list[dict],  # List of {"problem": str, "answer": str/int}
     base_url: str,
     model: str,
     max_tokens: int = 8192,
     temperature: float = 0.7,
+    n_samples: int = 8,
 ) -> list[dict]:
-    """Generate teacher completions using the vLLM server.
+    """Generate teacher completions with n samples per problem and math verification.
+
+    For each problem:
+    1. Generate n_samples completions
+    2. Verify each against the gold answer using math_verify
+    3. Select the first correct completion (or best available if none correct)
 
     vLLM automatically parses reasoning_content for reasoning models (gpt-oss, DeepSeek-R1, etc.)
     and the client combines it into <think>...</think><answer>...</answer> format.
@@ -219,6 +271,7 @@ def generate_teacher_completions(
     client = VLLMOpenAIClient(
         base_url=base_url,
         model=model,
+        max_concurrent_requests=256,  # Higher concurrency for n_samples
     )
 
     # Simple system prompt - reasoning is handled by the model natively
@@ -227,36 +280,76 @@ def generate_teacher_completions(
         "Show your complete reasoning process, then provide the final answer with \\boxed{}."
     )
 
-    logger.info(f"Generating completions for {len(problems)} problems...")
+    # Expand prompts: each problem gets n_samples copies
+    expanded_prompts = []
+    problem_indices = []  # Track which problem each prompt belongs to
+    for i, item in enumerate(problems):
+        prompt = AIME_PROMPT_TEMPLATE.format(question=item["problem"])
+        for _ in range(n_samples):
+            expanded_prompts.append(prompt)
+            problem_indices.append(i)
+
+    logger.info(f"Generating {n_samples} samples for {len(problems)} problems ({len(expanded_prompts)} total requests)...")
     result = client.get_teacher_completions(
-        prompts=problems,
+        prompts=expanded_prompts,
         max_tokens=max_tokens,
         temperature=temperature,
         system_prompt=system_prompt,
-        include_reasoning=True,  # vLLM will parse reasoning_content -> <think>/<answer>
+        include_reasoning=True,
     )
 
-    # Format as training data, filtering out failed requests
+    # Group completions by problem
+    completions_by_problem: dict[int, list[str]] = {}
+    for idx, completion in zip(problem_indices, result["completions"]):
+        if idx not in completions_by_problem:
+            completions_by_problem[idx] = []
+        completions_by_problem[idx].append(completion)
+
+    # Select best completion for each problem (first correct one, or first non-empty)
     training_data = []
+    verified_count = 0
     failed_count = 0
 
-    for prompt, completion in zip(result["prompts"], result["completions"]):
-        # Skip failed/null completions
-        if completion is None or completion.startswith("ERROR:") or completion.strip() == "":
+    for i, item in enumerate(problems):
+        candidates = completions_by_problem.get(i, [])
+        gold_answer = item.get("answer", "")
+        prompt = AIME_PROMPT_TEMPLATE.format(question=item["problem"])
+
+        # Filter out failed completions
+        valid_candidates = [
+            c for c in candidates
+            if c is not None and not c.startswith("ERROR:") and c.strip() != ""
+        ]
+
+        if not valid_candidates:
             failed_count += 1
-            logger.warning(f"Skipping failed completion for prompt: {prompt[:100]}...")
+            logger.warning(f"No valid completions for problem {i}: {item['problem'][:80]}...")
             continue
+
+        # Try to find a verified correct answer
+        selected_completion = None
+        for completion in valid_candidates:
+            if verify_answer(completion, gold_answer):
+                selected_completion = completion
+                verified_count += 1
+                break
+
+        # If no verified answer, use the first valid completion
+        if selected_completion is None:
+            selected_completion = valid_candidates[0]
+            logger.debug(f"Problem {i}: No verified answer, using first completion")
 
         training_data.append({
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
-                {"role": "assistant", "content": completion},
+                {"role": "assistant", "content": selected_completion},
             ]
         })
 
+    logger.info(f"Verification results: {verified_count}/{len(problems)} problems have verified correct answers")
     if failed_count > 0:
-        logger.warning(f"Filtered out {failed_count}/{len(problems)} failed completions")
+        logger.warning(f"Failed to generate for {failed_count}/{len(problems)} problems")
 
     # Log format info
     has_reasoning = any("<think>" in d["messages"][2]["content"] for d in training_data[:5])
@@ -308,13 +401,13 @@ def load_or_create_dataset(args: ScriptArguments) -> Dataset:
                     }
                 dataset = Dataset.from_list([convert_to_messages(item) for item in data])
             else:
-                # No solutions - generate from teacher
-                logger.info("Dataset has problems but no solutions. Generating from teacher...")
-                problems = [AIME_PROMPT_TEMPLATE.format(question=item["problem"]) for item in data]
+                # No solutions - generate from teacher with n=8 sampling and verification
+                logger.info("Dataset has problems but no solutions. Generating from teacher with verification...")
                 training_data = generate_teacher_completions(
-                    problems=problems,
+                    problems=data,  # Pass full problem data with answers for verification
                     base_url=args.teacher_base_url,
                     model=args.teacher_model,
+                    n_samples=8,  # Generate 8 samples per problem
                 )
                 dataset = Dataset.from_list(training_data)
 
@@ -345,12 +438,13 @@ def load_or_create_dataset(args: ScriptArguments) -> Dataset:
                 dataset = dataset.map(convert_to_messages)
 
     elif args.generate_teacher_data and args.aime_problems_path:
-        # Generate teacher completions from problems file
-        problems = load_aime_problems(args.aime_problems_path, apply_template=True)
+        # Generate teacher completions from problems file with n=8 sampling
+        problems_data = load_aime_problems(args.aime_problems_path, apply_template=False, return_raw=True)
         training_data = generate_teacher_completions(
-            problems=problems,
+            problems=problems_data,  # Pass full data with answers
             base_url=args.teacher_base_url,
             model=args.teacher_model,
+            n_samples=8,
         )
         dataset = Dataset.from_list(training_data)
 
