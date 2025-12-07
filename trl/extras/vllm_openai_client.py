@@ -13,21 +13,34 @@
 # limitations under the License.
 
 """
-OpenAI-compatible vLLM client for GOLD training.
+OpenAI-compatible vLLM client for GOLD training with async batch support.
 
 This client communicates with vLLM servers that expose the OpenAI-compatible API
-(e.g., `/v1/completions`, `/v1/chat/completions`).
+(e.g., `/v1/completions`, `/v1/chat/completions`) with concurrent async requests.
 """
 
+import asyncio
 import logging
 import time
 from typing import Any
 
 from ..import_utils import is_openai_available
 
+try:
+    from tqdm.asyncio import tqdm_asyncio
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
+try:
+    import nest_asyncio
+    NEST_ASYNCIO_AVAILABLE = True
+except ImportError:
+    NEST_ASYNCIO_AVAILABLE = False
+
 
 if is_openai_available():
-    from openai import OpenAI
+    from openai import AsyncOpenAI, OpenAI
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +53,8 @@ class VLLMOpenAIClient:
     This client is useful when your vLLM server exposes the standard OpenAI API endpoints
     (e.g., `/v1/completions`, `/v1/chat/completions`) rather than the TRL-specific endpoints.
 
+    Supports async batch processing for high throughput.
+
     Args:
         base_url (`str`):
             Base URL for the vLLM server (e.g., `"http://localhost:8000/v1"`).
@@ -47,17 +62,20 @@ class VLLMOpenAIClient:
             API key for authentication. vLLM typically doesn't require a real key.
         model (`str`, *optional*, defaults to `None`):
             Model name to use for requests. If None, must be specified in each request.
-        connection_timeout (`float`, *optional*, defaults to `60.0`):
+        connection_timeout (`float`, *optional*, defaults to `120.0`):
             Timeout for connecting to the server.
         max_retries (`int`, *optional*, defaults to `3`):
             Maximum number of retries for failed requests.
+        max_concurrent_requests (`int`, *optional*, defaults to `32`):
+            Maximum number of concurrent async requests.
 
     Examples:
         ```python
         >>> from trl.extras.vllm_openai_client import VLLMOpenAIClient
         >>> client = VLLMOpenAIClient(
         ...     base_url="http://my-vllm-server:8000/v1",
-        ...     model="openai/gpt-oss-120b"
+        ...     model="openai/gpt-oss-120b",
+        ...     max_concurrent_requests=64
         ... )
         >>> response = client.generate(["Hello, world!"], max_tokens=100)
         ```
@@ -68,8 +86,9 @@ class VLLMOpenAIClient:
         base_url: str,
         api_key: str = "EMPTY",
         model: str | None = None,
-        connection_timeout: float = 60.0,
+        connection_timeout: float = 120.0,
         max_retries: int = 3,
+        max_concurrent_requests: int = 32,
     ):
         if not is_openai_available():
             raise ImportError(
@@ -80,13 +99,26 @@ class VLLMOpenAIClient:
         self.model = model
         self.connection_timeout = connection_timeout
         self.max_retries = max_retries
+        self.max_concurrent_requests = max_concurrent_requests
 
+        # Sync client for connection check
         self.client = OpenAI(
             base_url=self.base_url,
             api_key=api_key,
             timeout=connection_timeout,
             max_retries=max_retries,
         )
+
+        # Async client for batch processing
+        self.async_client = AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=api_key,
+            timeout=connection_timeout,
+            max_retries=max_retries,
+        )
+
+        # Semaphore for controlling concurrency
+        self._semaphore = None
 
         # Verify connection
         self._check_connection()
@@ -108,6 +140,96 @@ class VLLMOpenAIClient:
                         f"Failed to connect to vLLM server at {self.base_url} after {max_retries} attempts: {e}"
                     )
 
+    async def _async_chat_single(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None,
+        logprobs: bool,
+        top_logprobs: int | None,
+        semaphore: asyncio.Semaphore,
+        idx: int,
+        **kwargs,
+    ) -> tuple[int, str, Any]:
+        """Single async chat completion with semaphore for concurrency control."""
+        async with semaphore:
+            try:
+                response = await self.async_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    logprobs=logprobs,
+                    top_logprobs=top_logprobs,
+                    **kwargs,
+                )
+                content = response.choices[0].message.content
+                lp = response.choices[0].logprobs if logprobs else None
+                return (idx, content, lp)
+            except Exception as e:
+                logger.error(f"Request {idx} failed: {e}")
+                return (idx, f"ERROR: {e}", None)
+
+    async def _async_completion_single(
+        self,
+        prompt: str,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None,
+        logprobs: int | None,
+        echo: bool,
+        extra_body: dict | None,
+        semaphore: asyncio.Semaphore,
+        idx: int,
+        **kwargs,
+    ) -> tuple[int, str, Any]:
+        """Single async completion with semaphore for concurrency control."""
+        async with semaphore:
+            try:
+                response = await self.async_client.completions.create(
+                    model=model,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    logprobs=logprobs,
+                    echo=echo,
+                    extra_body=extra_body,
+                    **kwargs,
+                )
+                text = response.choices[0].text
+                lp = response.choices[0].logprobs.token_logprobs if response.choices[0].logprobs else None
+                return (idx, text, lp)
+            except Exception as e:
+                logger.error(f"Request {idx} failed: {e}")
+                return (idx, f"ERROR: {e}", None)
+
+    def _run_async(self, coro):
+        """Run an async coroutine, handling event loop properly."""
+        try:
+            loop = asyncio.get_running_loop()
+            # We're inside an async context, need to use nest_asyncio or run in thread
+            if NEST_ASYNCIO_AVAILABLE:
+                nest_asyncio.apply()
+                return loop.run_until_complete(coro)
+            else:
+                # Fallback: run in a new thread with its own event loop
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, coro)
+                    return future.result()
+        except RuntimeError:
+            # No running loop, we can create one
+            return asyncio.run(coro)
+
     def generate(
         self,
         prompts: list[str],
@@ -122,7 +244,7 @@ class VLLMOpenAIClient:
         **kwargs,
     ) -> dict[str, Any]:
         """
-        Generate completions for the given prompts using the OpenAI-compatible API.
+        Generate completions for the given prompts using async batch processing.
 
         Args:
             prompts (`list[str]`):
@@ -149,7 +271,6 @@ class VLLMOpenAIClient:
         Returns:
             `dict` with keys:
                 - `completions` (`list[str]`): Generated completion texts.
-                - `completion_ids` (`list[list[int]]`): Token IDs of completions (if available).
                 - `logprobs` (`list[list[float]]`): Log probabilities (if requested).
         """
         if self.model is None and "model" not in kwargs:
@@ -162,30 +283,42 @@ class VLLMOpenAIClient:
         if top_k > 0:
             extra_body["top_k"] = top_k
 
-        all_completions = []
-        all_logprobs = []
+        async def run_batch():
+            semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+            tasks = [
+                self._async_completion_single(
+                    prompt=prompt,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    logprobs=logprobs,
+                    echo=echo,
+                    extra_body=extra_body if extra_body else None,
+                    semaphore=semaphore,
+                    idx=i,
+                    **kwargs,
+                )
+                for i, prompt in enumerate(prompts)
+            ]
+            if TQDM_AVAILABLE:
+                return await tqdm_asyncio.gather(*tasks, desc="Generating completions")
+            return await asyncio.gather(*tasks)
 
-        for prompt in prompts:
-            response = self.client.completions.create(
-                model=model,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                n=n,
-                stop=stop,
-                logprobs=logprobs,
-                echo=echo,
-                extra_body=extra_body if extra_body else None,
-                **kwargs,
-            )
+        logger.info(f"Starting async batch of {len(prompts)} requests with max {self.max_concurrent_requests} concurrent")
+        start_time = time.time()
 
-            for choice in response.choices:
-                all_completions.append(choice.text)
-                if choice.logprobs is not None:
-                    # Extract token logprobs
-                    token_logprobs = choice.logprobs.token_logprobs or []
-                    all_logprobs.append(token_logprobs)
+        results = self._run_async(run_batch())
+
+        elapsed = time.time() - start_time
+        logger.info(f"Completed {len(prompts)} requests in {elapsed:.2f}s ({len(prompts)/elapsed:.2f} req/s)")
+
+        # Sort by index to maintain order
+        results = sorted(results, key=lambda x: x[0])
+
+        all_completions = [r[1] for r in results]
+        all_logprobs = [r[2] for r in results if r[2] is not None]
 
         return {
             "completions": all_completions,
@@ -205,7 +338,7 @@ class VLLMOpenAIClient:
         **kwargs,
     ) -> dict[str, Any]:
         """
-        Generate chat completions for the given message lists.
+        Generate chat completions using async batch processing.
 
         Args:
             messages (`list[list[dict]]`):
@@ -237,27 +370,41 @@ class VLLMOpenAIClient:
 
         model = kwargs.pop("model", self.model)
 
-        all_completions = []
-        all_logprobs = []
+        async def run_batch():
+            semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+            tasks = [
+                self._async_chat_single(
+                    messages=msg_list,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    logprobs=logprobs,
+                    top_logprobs=top_logprobs,
+                    semaphore=semaphore,
+                    idx=i,
+                    **kwargs,
+                )
+                for i, msg_list in enumerate(messages)
+            ]
+            if TQDM_AVAILABLE:
+                return await tqdm_asyncio.gather(*tasks, desc="Generating chat completions")
+            return await asyncio.gather(*tasks)
 
-        for message_list in messages:
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=message_list,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                n=n,
-                stop=stop,
-                logprobs=logprobs,
-                top_logprobs=top_logprobs,
-                **kwargs,
-            )
+        logger.info(f"Starting async batch of {len(messages)} requests with max {self.max_concurrent_requests} concurrent")
+        start_time = time.time()
 
-            for choice in response.choices:
-                all_completions.append(choice.message.content)
-                if choice.logprobs is not None:
-                    all_logprobs.append(choice.logprobs)
+        results = self._run_async(run_batch())
+
+        elapsed = time.time() - start_time
+        logger.info(f"Completed {len(messages)} requests in {elapsed:.2f}s ({len(messages)/elapsed:.2f} req/s)")
+
+        # Sort by index to maintain order
+        results = sorted(results, key=lambda x: x[0])
+
+        all_completions = [r[1] for r in results]
+        all_logprobs = [r[2] for r in results if r[2] is not None]
 
         return {
             "completions": all_completions,
@@ -274,7 +421,7 @@ class VLLMOpenAIClient:
         **kwargs,
     ) -> dict[str, Any]:
         """
-        Generate teacher completions for distillation.
+        Generate teacher completions for distillation using async batch processing.
 
         This is a convenience method for generating high-quality completions
         from a teacher model for knowledge distillation.
