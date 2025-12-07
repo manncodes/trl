@@ -153,6 +153,7 @@ class VLLMOpenAIClient:
         semaphore: asyncio.Semaphore,
         idx: int,
         max_retries: int = 3,
+        include_reasoning: bool = True,
         **kwargs,
     ) -> tuple[int, str, Any]:
         """Single async chat completion with semaphore for concurrency control and retries."""
@@ -171,21 +172,35 @@ class VLLMOpenAIClient:
                         top_logprobs=top_logprobs,
                         **kwargs,
                     )
-                    content = response.choices[0].message.content
+                    message = response.choices[0].message
+                    content = message.content
+
+                    # Extract reasoning_content if available (vLLM parses this for reasoning models)
+                    reasoning_content = getattr(message, "reasoning_content", None)
 
                     # Handle null/empty content - retry
                     if content is None or content.strip() == "":
-                        last_error = "Empty response from model"
-                        if attempt < max_retries - 1:
-                            logger.warning(f"Request {idx} got empty response, retrying ({attempt + 1}/{max_retries})...")
-                            await asyncio.sleep(1.0 * (attempt + 1))  # backoff
-                            continue
+                        # Check if we at least have reasoning content
+                        if reasoning_content and reasoning_content.strip():
+                            content = ""  # Will be combined with reasoning below
                         else:
-                            logger.error(f"Request {idx} failed after {max_retries} attempts: {last_error}")
-                            return (idx, f"ERROR: {last_error}", None)
+                            last_error = "Empty response from model"
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Request {idx} got empty response, retrying ({attempt + 1}/{max_retries})...")
+                                await asyncio.sleep(1.0 * (attempt + 1))  # backoff
+                                continue
+                            else:
+                                logger.error(f"Request {idx} failed after {max_retries} attempts: {last_error}")
+                                return (idx, f"ERROR: {last_error}", None)
+
+                    # Combine reasoning and content with <think>/<answer> tags
+                    if include_reasoning and reasoning_content:
+                        full_content = f"<think>\n{reasoning_content.strip()}\n</think>\n<answer>\n{content.strip()}\n</answer>"
+                    else:
+                        full_content = content
 
                     lp = response.choices[0].logprobs if logprobs else None
-                    return (idx, content, lp)
+                    return (idx, full_content, lp)
                 except Exception as e:
                     last_error = str(e)
                     if attempt < max_retries - 1:
@@ -357,6 +372,7 @@ class VLLMOpenAIClient:
         stop: list[str] | None = None,
         logprobs: bool = False,
         top_logprobs: int | None = None,
+        include_reasoning: bool = True,
         **kwargs,
     ) -> dict[str, Any]:
         """
@@ -379,6 +395,8 @@ class VLLMOpenAIClient:
                 Whether to return log probabilities.
             top_logprobs (`int`, *optional*):
                 Number of top log probabilities to return.
+            include_reasoning (`bool`, *optional*, defaults to `True`):
+                Whether to include reasoning_content in <think> tags (for reasoning models).
             **kwargs:
                 Additional parameters to pass to the API.
 
@@ -406,6 +424,7 @@ class VLLMOpenAIClient:
                     top_logprobs=top_logprobs,
                     semaphore=semaphore,
                     idx=i,
+                    include_reasoning=include_reasoning,
                     **kwargs,
                 )
                 for i, msg_list in enumerate(messages)
@@ -440,6 +459,7 @@ class VLLMOpenAIClient:
         temperature: float = 0.7,
         top_p: float = 0.95,
         system_prompt: str | None = None,
+        include_reasoning: bool = True,
         **kwargs,
     ) -> dict[str, Any]:
         """
@@ -447,6 +467,11 @@ class VLLMOpenAIClient:
 
         This is a convenience method for generating high-quality completions
         from a teacher model for knowledge distillation.
+
+        For reasoning models (like gpt-oss-120b), if vLLM returns `reasoning_content`,
+        it will be automatically formatted as:
+        <think>[reasoning_content]</think>
+        <answer>[content]</answer>
 
         Args:
             prompts (`list[str]`):
@@ -459,12 +484,14 @@ class VLLMOpenAIClient:
                 Top-p sampling parameter.
             system_prompt (`str`, *optional*):
                 System prompt to use.
+            include_reasoning (`bool`, *optional*, defaults to `True`):
+                Whether to include reasoning_content in <think> tags.
             **kwargs:
                 Additional parameters.
 
         Returns:
             `dict` with:
-                - `completions` (`list[str]`): Teacher's solutions.
+                - `completions` (`list[str]`): Teacher's solutions (with <think>/<answer> if reasoning available).
                 - `prompts` (`list[str]`): Original prompts.
         """
         messages_list = []
@@ -478,6 +505,7 @@ class VLLMOpenAIClient:
         result = self.chat(
             messages=messages_list,
             max_tokens=max_tokens,
+            include_reasoning=include_reasoning,
             temperature=temperature,
             top_p=top_p,
             **kwargs,
