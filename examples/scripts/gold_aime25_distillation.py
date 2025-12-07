@@ -213,35 +213,27 @@ def load_aime_problems(path: str, apply_template: bool = True, return_raw: bool 
 
 
 def verify_answer(completion: str, gold_answer: str | int | float) -> bool:
-    """Verify if the completion contains the correct answer using math_verify."""
+    """Verify if the completion contains the correct answer using trl.rewards.accuracy_rewards."""
     try:
-        from math_verify import parse, verify
+        from trl.rewards.accuracy_rewards import reasoning_accuracy_reward
     except ImportError:
-        logger.warning("math_verify not installed. Install with: pip install math-verify[antlr4_13_2]")
+        logger.warning("Could not import accuracy_rewards. Make sure math_verify is installed.")
         return False
 
     try:
-        # Parse gold answer
-        gold_parsed = parse(str(gold_answer))
+        # Format as expected by reasoning_accuracy_reward
+        completions = [[{"role": "assistant", "content": completion}]]
+        solution = [str(gold_answer)]
 
-        # Extract answer from completion (look in <answer> tags or \boxed{})
-        import re
-        answer_text = completion
+        # Use reasoning_accuracy_reward which handles </think> delimiters
+        rewards = reasoning_accuracy_reward(
+            completions=completions,
+            solution=solution,
+            reasoning_delimiters=["</think>", "</answer>"],
+        )
 
-        # Try to extract from <answer> tags first
-        answer_match = re.search(r'<answer>(.*?)</answer>', completion, re.DOTALL)
-        if answer_match:
-            answer_text = answer_match.group(1)
-
-        # Try to find \boxed{} content
-        boxed_match = re.search(r'\\boxed\{([^}]+)\}', answer_text)
-        if boxed_match:
-            answer_text = boxed_match.group(1)
-
-        # Parse the extracted answer
-        pred_parsed = parse(answer_text)
-
-        return verify(gold_parsed, pred_parsed)
+        # Return True if reward is 1.0 (correct), False otherwise
+        return rewards[0] == 1.0
     except Exception as e:
         logger.debug(f"Verification failed: {e}")
         return False
