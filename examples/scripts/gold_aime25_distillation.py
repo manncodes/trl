@@ -569,25 +569,14 @@ def main():
     # No need for logit-level distillation
     training_args.seq_kd = True
 
-    # === TRAINING HYPERPARAMETERS (hardcoded for reliability) ===
-    training_args.num_train_epochs = 50
-    training_args.per_device_train_batch_size = 8
-    training_args.gradient_accumulation_steps = 1
-    training_args.learning_rate = 5e-5
-    training_args.max_grad_norm = 1.0
-    training_args.warmup_ratio = 0.05
-    training_args.weight_decay = 0.01
-    training_args.bf16 = True
-    training_args.tf32 = True
-    training_args.logging_steps = 1
-    training_args.optim = "adamw_torch_fused"
-    training_args.lr_scheduler_type = "cosine"
-    training_args.save_strategy = "steps"
-    training_args.save_steps = 100
-    training_args.dataloader_num_workers = 4
-    training_args.report_to = "none"  # Disable wandb (has bug)
+    # Set default output_dir if not provided
     if not training_args.output_dir:
         training_args.output_dir = "./aime25-distilled-custom-split-llama"
+
+    # Log key training settings
+    logger.info(f"Training config: epochs={training_args.num_train_epochs}, "
+                f"batch_size={training_args.per_device_train_batch_size}, "
+                f"lr={training_args.learning_rate}")
 
     # Initialize the trainer
     logger.info("Initializing GOLDTrainer...")
