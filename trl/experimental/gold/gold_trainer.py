@@ -859,11 +859,37 @@ class GOLDTrainer(SFTTrainer):
         if self.use_vllm_teacher:
             # Initialize vLLM teacher client
             self.teacher_model = None
-            self.vllm_teacher_client = VLLMClient(
-                host=args.vllm_teacher_server_host,
-                server_port=args.vllm_teacher_server_port,
-                connection_timeout=args.vllm_teacher_server_timeout,
-            )
+            self.vllm_teacher_api_type = getattr(args, "vllm_teacher_api_type", "openai")
+            self.vllm_teacher_model = getattr(args, "vllm_teacher_model", None)
+
+            if self.vllm_teacher_api_type == "openai":
+                # Use OpenAI-compatible API
+                from trl.extras.vllm_openai_client import VLLMOpenAIClient
+
+                base_url = getattr(args, "vllm_teacher_base_url", None)
+                if base_url is None:
+                    base_url = f"http://{args.vllm_teacher_server_host}:{args.vllm_teacher_server_port}/v1"
+
+                self.vllm_teacher_client = VLLMOpenAIClient(
+                    base_url=base_url,
+                    api_key=getattr(args, "vllm_teacher_api_key", "EMPTY"),
+                    model=self.vllm_teacher_model,
+                    connection_timeout=args.vllm_teacher_server_timeout,
+                )
+                # OpenAI API doesn't support full vocab logits, so enable seq_kd mode
+                if not self.seq_kd and not self.use_uld_loss:
+                    warnings.warn(
+                        "Using OpenAI-compatible vLLM teacher API. Since full vocabulary logits are not available, "
+                        "consider enabling seq_kd=True for sequence-level knowledge distillation, or use "
+                        "vllm_teacher_api_type='trl' with a TRL vLLM server for logit-level distillation."
+                    )
+            else:
+                # Use TRL-specific API with /get_logits endpoint
+                self.vllm_teacher_client = VLLMClient(
+                    host=args.vllm_teacher_server_host,
+                    server_port=args.vllm_teacher_server_port,
+                    connection_timeout=args.vllm_teacher_server_timeout,
+                )
         else:
             if not args.use_uld_loss:
                 teacher_model.resize_token_embeddings(self.model.config.vocab_size)

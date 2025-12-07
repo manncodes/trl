@@ -34,6 +34,7 @@ _liger_kernel_available, _liger_kernel_version = _is_package_available("liger_ke
 _llm_blender_available = _is_package_available("llm_blender")
 _math_verify_available = _is_package_available("math_verify")
 _mergekit_available = _is_package_available("mergekit")
+_openai_available = _is_package_available("openai")
 _pydantic_available = _is_package_available("pydantic")
 _requests_available = _is_package_available("requests")
 _unsloth_available = _is_package_available("unsloth")
@@ -69,6 +70,10 @@ def is_math_verify_available() -> bool:
 
 def is_mergekit_available() -> bool:
     return _mergekit_available
+
+
+def is_openai_available() -> bool:
+    return _openai_available
 
 
 def is_pydantic_available() -> bool:

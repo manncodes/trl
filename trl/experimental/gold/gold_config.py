@@ -322,22 +322,47 @@ class GOLDConfig(SFTConfig):
     use_vllm_teacher: bool = field(
         default=False,
         metadata={
-            "help": "Whether to use vLLM for the teacher model to get logits. When enabled, the teacher model "
-            "runs on a separate vLLM server and logits are fetched via HTTP. Requires a running vLLM server "
-            "for the teacher model."
+            "help": "Whether to use vLLM for the teacher model to get logits/completions. When enabled, the teacher "
+            "model runs on a separate vLLM server. Requires a running vLLM server for the teacher model."
+        },
+    )
+    vllm_teacher_api_type: str = field(
+        default="openai",
+        metadata={
+            "help": "Type of vLLM API to use for the teacher. 'openai' for OpenAI-compatible API "
+            "(e.g., /v1/completions), 'trl' for TRL-specific API (e.g., /get_logits/). "
+            "Use 'openai' for standard vLLM deployments, 'trl' for servers started with `trl vllm-serve`."
+        },
+    )
+    vllm_teacher_base_url: str | None = field(
+        default=None,
+        metadata={
+            "help": "Base URL for the teacher vLLM server. For OpenAI-compatible API, include /v1 suffix "
+            "(e.g., 'http://localhost:8000/v1'). If None, constructs URL from host:port."
         },
     )
     vllm_teacher_server_host: str = field(
         default="0.0.0.0",
-        metadata={"help": 'Host of the vLLM server for the teacher model when `use_vllm_teacher=True`.'},
+        metadata={"help": 'Host of the vLLM server for the teacher model (used when vllm_teacher_base_url is None).'},
     )
     vllm_teacher_server_port: int = field(
         default=8002,
-        metadata={"help": 'Port of the vLLM server for the teacher model when `use_vllm_teacher=True`.'},
+        metadata={"help": 'Port of the vLLM server for the teacher model (used when vllm_teacher_base_url is None).'},
     )
     vllm_teacher_server_timeout: float = field(
         default=240.0,
         metadata={"help": 'Timeout (in seconds) for connecting to the teacher vLLM server.'},
+    )
+    vllm_teacher_model: str | None = field(
+        default=None,
+        metadata={
+            "help": "Model name for the teacher vLLM server. Required when using OpenAI-compatible API "
+            "(vllm_teacher_api_type='openai')."
+        },
+    )
+    vllm_teacher_api_key: str = field(
+        default="EMPTY",
+        metadata={"help": "API key for the teacher vLLM server. Usually 'EMPTY' for vLLM."},
     )
 
     # Parameters that control the logging
