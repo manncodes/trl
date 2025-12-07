@@ -22,7 +22,7 @@ use_vllm_teacher: true
 vllm_teacher_api_type: openai
 vllm_teacher_base_url: "http://qpn744-vllm-gptoss120b-svc.llm-pretraining.svc.cluster.local:8000/v1"
 vllm_teacher_model: "openai/gpt-oss-120b"
-teacher_tokenizer_name_or_path: "meta-llama/Llama-3.1-8B-Instruct"
+teacher_tokenizer_name_or_path: "openai/gpt-oss-120b"
 
 # Training mode
 # Since OpenAI API doesn't provide full vocab logits, use sequence-level KD

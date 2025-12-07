@@ -141,8 +141,8 @@ class ScriptArguments:
         metadata={"help": "Model name on the vLLM server"},
     )
     teacher_tokenizer: str = field(
-        default="meta-llama/Llama-3.1-8B-Instruct",
-        metadata={"help": "Tokenizer for the teacher model (Llama family)"},
+        default="openai/gpt-oss-120b",
+        metadata={"help": "Tokenizer for the teacher model (gpt-oss-120b)"},
     )
 
 
