@@ -1433,7 +1433,10 @@ class GOLDTrainer(SFTTrainer):
         # For sequence-level KD (seq_kd=True), we use standard SFT loss on teacher completions
         # instead of logit distillation. This is useful when teacher API doesn't provide logits.
         if self.seq_kd:
-            return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+            # Filter out GOLD-specific keys that the model's forward() doesn't accept
+            gold_keys = ["prompts", "original_prompt_text", "original_completion_text"]
+            filtered_inputs = {k: v for k, v in inputs.items() if k not in gold_keys}
+            return super().compute_loss(model, filtered_inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
 
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             if "original_prompt_text" in inputs and "original_completion_text" in inputs:
