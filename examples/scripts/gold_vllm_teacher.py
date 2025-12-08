@@ -481,12 +481,9 @@ class HybridGOLDTrainer:
 
         # Phase 3: Compute logits via transformers forward pass
         if self.cross_tokenizer:
-            # Cross-tokenizer: separate inputs for student and teacher
-            teacher_logits = compute_teacher_logits_batch(
-                self.teacher_model,
-                teacher_batch["input_ids"],
-                teacher_batch["attention_mask"],
-            )
+            # Cross-tokenizer: Can't directly compare logits (different vocab sizes)
+            # Use cross-entropy loss: student learns to predict teacher-generated tokens
+            # This is essentially sequence-level KD with the student's own tokenization
 
             self.student_model.train()
             student_logits = compute_student_logits_batch(
@@ -495,48 +492,18 @@ class HybridGOLDTrainer:
                 student_batch["attention_mask"],
             )
 
-            # For cross-tokenizer, we need to align by completion tokens
-            # Simple approach: truncate to minimum completion length
-            student_prompt_lens = student_batch["prompt_lengths"]
-            teacher_prompt_lens = teacher_batch["prompt_lengths"]
+            # Shift logits and labels for next-token prediction
+            shifted_student_logits = student_logits[:, :-1, :].contiguous()
+            shifted_labels = student_batch["labels"][:, 1:].contiguous()
 
-            # Compute loss per sample and average
-            total_loss = 0.0
-            num_valid = 0
-
-            for i in range(len(valid_prompts)):
-                s_prompt_len = student_prompt_lens[i]
-                t_prompt_len = teacher_prompt_lens[i]
-
-                # Get completion logits (after prompt)
-                s_completion_logits = student_logits[i, s_prompt_len - 1:-1, :]
-                t_completion_logits = teacher_logits[i, t_prompt_len - 1:-1, :]
-                s_labels = student_batch["labels"][i, s_prompt_len:]
-
-                # Truncate to minimum length
-                min_len = min(s_completion_logits.shape[0], t_completion_logits.shape[0])
-                if min_len == 0:
-                    continue
-
-                s_completion_logits = s_completion_logits[:min_len]
-                t_completion_logits = t_completion_logits[:min_len]
-                s_labels = s_labels[:min_len]
-
-                # Compute loss for this sample
-                sample_loss = generalized_jsd_loss(
-                    student_logits=s_completion_logits.unsqueeze(0),
-                    teacher_logits=t_completion_logits.unsqueeze(0),
-                    labels=s_labels.unsqueeze(0),
-                    beta=self.args.beta,
-                    temperature=self.args.temperature,
-                )
-                total_loss = total_loss + sample_loss
-                num_valid += 1
-
-            if num_valid == 0:
-                return torch.tensor(0.0, device=self.device, requires_grad=True)
-
-            loss = total_loss / num_valid
+            # Compute cross-entropy loss (student learns teacher's generated sequence)
+            # Flatten for cross-entropy
+            vocab_size = shifted_student_logits.shape[-1]
+            loss = F.cross_entropy(
+                shifted_student_logits.view(-1, vocab_size),
+                shifted_labels.view(-1),
+                ignore_index=-100,
+            )
 
         else:
             # Same tokenizer: direct computation
