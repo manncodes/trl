@@ -583,6 +583,14 @@ class HybridGOLDTrainer:
             prompts = train_dataset["prompt"]
         elif "question" in train_dataset.column_names:
             prompts = train_dataset["question"]
+        elif "problem" in train_dataset.column_names:
+            # Math dataset format (e.g., AIME) - format as math prompt
+            prompts = []
+            for item in train_dataset:
+                problem = item["problem"]
+                # Format as a math reasoning prompt
+                formatted_prompt = f"{problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+                prompts.append(formatted_prompt)
         else:
             raise ValueError(f"Unknown dataset format. Columns: {train_dataset.column_names}")
 
