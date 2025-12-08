@@ -258,6 +258,104 @@ def generalized_jsd_loss(
         return jsd.mean()
 
 
+def uld_sorted_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    student_labels: torch.Tensor | None = None,
+    teacher_labels: torch.Tensor | None = None,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Universal Logit Distillation loss using sorted probability comparison.
+
+    This enables distillation between models with DIFFERENT vocabulary sizes
+    by comparing the SHAPE of probability distributions rather than
+    specific token probabilities.
+
+    Algorithm:
+    1. Convert logits to probabilities (softmax with temperature)
+    2. Sort both distributions in descending order
+    3. Pad smaller vocab to match larger vocab (with zeros)
+    4. Compute L1 loss between sorted distributions
+
+    This works because:
+    - Sorting removes token identity - only distribution shape matters
+    - A well-trained student should have similar confidence patterns as teacher
+    - "How spread out is the probability mass?" is vocab-agnostic
+
+    Args:
+        student_logits: [batch_size, seq_len, student_vocab_size]
+        teacher_logits: [batch_size, seq_len, teacher_vocab_size]
+        student_labels: [batch_size, seq_len] with -100 for tokens to ignore (student tokenization)
+        teacher_labels: [batch_size, seq_len] with -100 for tokens to ignore (teacher tokenization)
+        temperature: Softmax temperature for distillation
+
+    Returns:
+        Scalar loss tensor
+    """
+    # Temperature scaling and convert to probabilities
+    student_probs = F.softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+
+    batch_size = student_probs.size(0)
+    device = student_probs.device
+
+    losses = []
+
+    for i in range(batch_size):
+        # Get masks for valid positions (completion tokens only)
+        if student_labels is not None:
+            student_mask = student_labels[i] != -100
+        else:
+            student_mask = torch.ones(student_probs.size(1), dtype=torch.bool, device=device)
+
+        if teacher_labels is not None:
+            teacher_mask = teacher_labels[i] != -100
+        else:
+            teacher_mask = torch.ones(teacher_probs.size(1), dtype=torch.bool, device=device)
+
+        # Get valid positions count
+        student_valid = student_mask.sum().item()
+        teacher_valid = teacher_mask.sum().item()
+
+        if student_valid == 0 or teacher_valid == 0:
+            continue
+
+        # Use minimum length for alignment (different tokenizations may have different lengths)
+        min_valid = min(student_valid, teacher_valid)
+
+        # Get the first min_valid valid positions from each
+        student_valid_indices = torch.where(student_mask)[0][:min_valid]
+        teacher_valid_indices = torch.where(teacher_mask)[0][:min_valid]
+
+        # Extract probabilities for valid positions
+        student_p = student_probs[i, student_valid_indices]  # [min_valid, student_vocab]
+        teacher_p = teacher_probs[i, teacher_valid_indices]  # [min_valid, teacher_vocab]
+
+        # Sort probabilities in descending order (removes token identity)
+        student_sorted = student_p.sort(dim=-1, descending=True).values
+        teacher_sorted = teacher_p.sort(dim=-1, descending=True).values
+
+        # Pad smaller vocab to match larger
+        student_vocab_size = student_sorted.size(-1)
+        teacher_vocab_size = teacher_sorted.size(-1)
+        max_vocab_size = max(student_vocab_size, teacher_vocab_size)
+
+        if student_vocab_size < max_vocab_size:
+            student_sorted = F.pad(student_sorted, (0, max_vocab_size - student_vocab_size))
+        if teacher_vocab_size < max_vocab_size:
+            teacher_sorted = F.pad(teacher_sorted, (0, max_vocab_size - teacher_vocab_size))
+
+        # L1 loss on sorted distributions
+        loss_i = F.l1_loss(student_sorted, teacher_sorted, reduction="mean")
+        losses.append(loss_i)
+
+    if not losses:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    return torch.stack(losses).mean()
+
+
 @torch.no_grad()
 def compute_teacher_logits_batch(
     model: torch.nn.Module,
@@ -317,9 +415,12 @@ class HybridGOLDTrainer:
         # Check if we're doing cross-tokenizer distillation
         self.cross_tokenizer = teacher_tokenizer is not None
         if self.cross_tokenizer:
-            logger.info("Cross-tokenizer distillation enabled")
+            logger.info("Cross-tokenizer distillation enabled (using ULD sorted loss)")
             logger.info(f"  Student vocab size: {len(self.student_tokenizer)}")
             logger.info(f"  Teacher vocab size: {len(self.teacher_tokenizer)}")
+            logger.info("  Loss: ULD sorted probability comparison (vocab-agnostic)")
+        else:
+            logger.info("Same-tokenizer distillation (using JSD loss)")
 
         # Freeze teacher
         for param in self.teacher_model.parameters():
@@ -481,10 +582,17 @@ class HybridGOLDTrainer:
 
         # Phase 3: Compute logits via transformers forward pass
         if self.cross_tokenizer:
-            # Cross-tokenizer: Can't directly compare logits (different vocab sizes)
-            # Use cross-entropy loss: student learns to predict teacher-generated tokens
-            # This is essentially sequence-level KD with the student's own tokenization
+            # Cross-tokenizer: Use ULD sorted loss (compares distribution shapes)
+            # This works with different vocab sizes by sorting probabilities
 
+            # Compute teacher logits using teacher tokenization
+            teacher_logits = compute_teacher_logits_batch(
+                self.teacher_model,
+                teacher_batch["input_ids"],
+                teacher_batch["attention_mask"],
+            )
+
+            # Compute student logits using student tokenization
             self.student_model.train()
             student_logits = compute_student_logits_batch(
                 self.student_model,
@@ -494,15 +602,17 @@ class HybridGOLDTrainer:
 
             # Shift logits and labels for next-token prediction
             shifted_student_logits = student_logits[:, :-1, :].contiguous()
-            shifted_labels = student_batch["labels"][:, 1:].contiguous()
+            shifted_teacher_logits = teacher_logits[:, :-1, :].contiguous()
+            shifted_student_labels = student_batch["labels"][:, 1:].contiguous()
+            shifted_teacher_labels = teacher_batch["labels"][:, 1:].contiguous()
 
-            # Compute cross-entropy loss (student learns teacher's generated sequence)
-            # Flatten for cross-entropy
-            vocab_size = shifted_student_logits.shape[-1]
-            loss = F.cross_entropy(
-                shifted_student_logits.view(-1, vocab_size),
-                shifted_labels.view(-1),
-                ignore_index=-100,
+            # Compute ULD loss (sorted probability comparison)
+            loss = uld_sorted_loss(
+                student_logits=shifted_student_logits,
+                teacher_logits=shifted_teacher_logits,
+                student_labels=shifted_student_labels,
+                teacher_labels=shifted_teacher_labels,
+                temperature=self.args.temperature,
             )
 
         else:
@@ -718,12 +828,15 @@ def main():
 
     # Train
     logger.info("Starting training...")
-    logger.info(f"  Beta (JSD interpolation): {args.beta}")
     logger.info(f"  Temperature: {args.temperature}")
     logger.info(f"  Generation temperature: {args.generation_temperature}")
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
     logger.info(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    if teacher_tokenizer is None:
+        logger.info(f"  Loss: JSD with beta={args.beta}")
+    else:
+        logger.info("  Loss: ULD sorted (cross-tokenizer)")
 
     trainer.train(dataset)
 
