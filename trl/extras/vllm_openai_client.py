@@ -26,7 +26,7 @@ import logging
 import time
 from typing import Any
 
-from ..import_utils import is_openai_available
+from transformers.utils import is_openai_available
 
 
 try:
